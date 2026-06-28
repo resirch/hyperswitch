@@ -30,6 +30,8 @@ pub struct Config {
     pub current_monitor_only: bool,
     /// When true, draw the selected window's title below the icon row.
     pub show_title: bool,
+    /// When true, register a logon scheduled task to start Hyperswitch.
+    pub run_on_startup: bool,
 }
 
 impl Default for Config {
@@ -45,6 +47,7 @@ impl Default for Config {
             icon_size: 64,
             current_monitor_only: true,
             show_title: true,
+            run_on_startup: false,
         }
     }
 }

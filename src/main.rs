@@ -5,6 +5,7 @@ mod focus;
 mod hook;
 mod icon_draw;
 mod overlay;
+mod startup;
 mod state;
 mod windows_enum;
 
@@ -25,6 +26,7 @@ const ID_TRAY_RELOAD: u32 = 1001;
 const ID_TRAY_EXIT: u32 = 1002;
 const ID_TRAY_SHOW_TITLE: u32 = 1003;
 const ID_TRAY_CURRENT_MONITOR: u32 = 1004;
+const ID_TRAY_STARTUP: u32 = 1005;
 
 fn main() {
     unsafe {
@@ -35,6 +37,7 @@ fn main() {
         }
 
         let config = Config::load_or_create();
+        let _ = startup::sync(config.run_on_startup);
 
         if overlay::register_class().is_err() {
             return;
@@ -201,9 +204,15 @@ pub fn show_tray_menu(hwnd: HWND) {
             Err(_) => return,
         };
         // Reflect current values so the checkmarks are accurate.
-        let (show_title, current_monitor_only) =
-            state::with(|st| (st.config.show_title, st.config.current_monitor_only))
-                .unwrap_or((true, false));
+        let (show_title, current_monitor_only, run_on_startup) =
+            state::with(|st| {
+                (
+                    st.config.show_title,
+                    st.config.current_monitor_only,
+                    st.config.run_on_startup,
+                )
+            })
+            .unwrap_or((true, false, false));
         let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
 
         let _ = AppendMenuW(
@@ -217,6 +226,12 @@ pub fn show_tray_menu(hwnd: HWND) {
             MF_STRING | check(current_monitor_only),
             ID_TRAY_CURRENT_MONITOR as usize,
             w!("Current monitor only"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | check(run_on_startup),
+            ID_TRAY_STARTUP as usize,
+            w!("Run on startup"),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_TRAY_RELOAD as usize, w!("Reload config"));
@@ -246,6 +261,7 @@ pub fn handle_command(hwnd: HWND, id: u32) {
     match id {
         ID_TRAY_RELOAD => {
             let cfg = Config::load_or_create();
+            let _ = startup::sync(cfg.run_on_startup);
             state::with(|st| st.config = cfg);
         }
         ID_TRAY_SHOW_TITLE => {
@@ -258,6 +274,13 @@ pub fn handle_command(hwnd: HWND, id: u32) {
             state::with(|st| {
                 st.config.current_monitor_only = !st.config.current_monitor_only;
                 let _ = st.config.save();
+            });
+        }
+        ID_TRAY_STARTUP => {
+            state::with(|st| {
+                st.config.run_on_startup = !st.config.run_on_startup;
+                let _ = st.config.save();
+                let _ = startup::sync(st.config.run_on_startup);
             });
         }
         ID_TRAY_EXIT => unsafe {

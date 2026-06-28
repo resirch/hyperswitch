@@ -66,6 +66,17 @@ fn main() {
     res.set_version_info(winresource::VersionInfo::PRODUCTVERSION, version);
     res.set("FileVersion", &version_text);
     res.set("ProductVersion", &version_text);
+    res.set_manifest(
+        r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>"#,
+    );
     // Force the resource compiler to rebuild when the icon hash changes.
     res.append_rc_content(&format!("// icon-hash: {icon_hash}\n"));
     if let Err(e) = res.compile() {
