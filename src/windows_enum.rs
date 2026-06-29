@@ -48,6 +48,11 @@ extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     TRUE
 }
 
+/// Return true when `hwnd` is a normal alt-tab target (visible, titled, etc.).
+pub fn is_switchable_window(hwnd: HWND) -> bool {
+    unsafe { is_alt_tab_window(hwnd) }
+}
+
 /// Standard "is this in the Alt+Tab list" test plus DWM-cloak filtering.
 unsafe fn is_alt_tab_window(hwnd: HWND) -> bool {
     if !IsWindowVisible(hwnd).as_bool() {

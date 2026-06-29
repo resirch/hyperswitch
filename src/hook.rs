@@ -116,7 +116,7 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
                     let target = st.windows[idx].hwnd;
                     close_window(target);
                     st.windows.remove(idx);
-                    st.cached_order.retain(|h| h.0 != target.0);
+                    st.recent_hwnds.retain(|h| h.0 != target.0);
                     if st.windows.is_empty() {
                         st.visible = false;
                         post(overlay, state::WM_HS_HIDE);
@@ -156,7 +156,9 @@ fn handle_key(vk: u32, is_down: bool, is_up: bool) -> bool {
             if !st.visible {
                 if st.all_hold_mods_down() {
                     let fresh = enumerate_windows();
-                    let ordered = st.reconcile(fresh);
+                    let fg = unsafe { GetForegroundWindow() };
+                    st.touch_recent(fg);
+                    let ordered = st.sort_by_recency(fresh);
                     st.windows = if st.config.current_monitor_only {
                         let cm = cursor_monitor();
                         ordered
@@ -166,16 +168,6 @@ fn handle_key(vk: u32, is_down: bool, is_up: bool) -> bool {
                     } else {
                         ordered
                     };
-                    // Always surface the currently focused window first, without
-                    // disturbing the stable order of the rest (cached_order is
-                    // left untouched).
-                    let fg = unsafe { GetForegroundWindow() };
-                    if let Some(pos) = st.windows.iter().position(|w| w.hwnd.0 == fg.0) {
-                        if pos != 0 {
-                            let item = st.windows.remove(pos);
-                            st.windows.insert(0, item);
-                        }
-                    }
                     if !st.windows.is_empty() {
                         st.selected = if st.windows.len() > 1 { 1 } else { 0 };
                         st.visible = true;

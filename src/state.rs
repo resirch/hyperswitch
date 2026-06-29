@@ -32,9 +32,8 @@ pub struct AppState {
     pub selected: usize,
     pub config: Config,
 
-    /// Persistent window ordering across activations so the row does not
-    /// reshuffle every time the overlay opens.
-    pub cached_order: Vec<HWND>,
+    /// Most-recently-used window order (front = most recent foreground).
+    pub recent_hwnds: Vec<HWND>,
 
     // Tracked physical modifier state (left/right tracked separately so that
     // releasing one side does not clear the other).
@@ -103,30 +102,35 @@ impl AppState {
         }
     }
 
-    /// Reconcile freshly enumerated windows against the cached order: keep the
-    /// existing relative order for windows still present, append newly-appeared
-    /// windows at the end, and drop windows that have closed. Returns the
-    /// windows in the stable order and updates the cache.
-    pub fn reconcile(&mut self, fresh: Vec<WindowInfo>) -> Vec<WindowInfo> {
-        let mut ordered: Vec<WindowInfo> = Vec::with_capacity(fresh.len());
-        let mut used = vec![false; fresh.len()];
+    /// Record that `hwnd` was just brought to the foreground.
+    pub fn touch_recent(&mut self, hwnd: HWND) {
+        if hwnd.0.is_null() {
+            return;
+        }
+        self.recent_hwnds.retain(|h| h.0 != hwnd.0);
+        self.recent_hwnds.insert(0, hwnd);
+    }
 
-        for cached in &self.cached_order {
-            if let Some(idx) = fresh.iter().position(|w| w.hwnd.0 == cached.0) {
-                if !used[idx] {
-                    used[idx] = true;
-                    ordered.push(fresh[idx].clone());
-                }
+    /// Sort `fresh` by MRU order (most recently used first). Updates the tracked
+    /// list to drop closed windows and append any newly seen ones.
+    pub fn sort_by_recency(&mut self, fresh: Vec<WindowInfo>) -> Vec<WindowInfo> {
+        let mut fresh = fresh;
+        fresh.sort_by_key(|w| {
+            self.recent_hwnds
+                .iter()
+                .position(|h| h.0 == w.hwnd.0)
+                .unwrap_or(usize::MAX)
+        });
+
+        let open: std::collections::HashSet<isize> =
+            fresh.iter().map(|w| w.hwnd.0 as isize).collect();
+        self.recent_hwnds.retain(|h| open.contains(&(h.0 as isize)));
+        for w in &fresh {
+            if !self.recent_hwnds.iter().any(|h| h.0 == w.hwnd.0) {
+                self.recent_hwnds.push(w.hwnd);
             }
         }
-        for (i, w) in fresh.iter().enumerate() {
-            if !used[i] {
-                ordered.push(w.clone());
-            }
-        }
-
-        self.cached_order = ordered.iter().map(|w| w.hwnd).collect();
-        ordered
+        fresh
     }
 
     pub fn select_next(&mut self) {

@@ -8,6 +8,7 @@ mod overlay;
 mod startup;
 mod state;
 mod windows_enum;
+mod win_event;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, POINT, WPARAM};
@@ -54,7 +55,7 @@ fn main() {
             windows: Vec::new(),
             selected: 0,
             config,
-            cached_order: Vec::new(),
+            recent_hwnds: Vec::new(),
             lctrl: false,
             rctrl: false,
             lalt: false,
@@ -67,6 +68,15 @@ fn main() {
 
         if hook::install().is_err() {
             return;
+        }
+        if win_event::install().is_err() {
+            return;
+        }
+
+        // Seed MRU with the current foreground window.
+        let fg = GetForegroundWindow();
+        if windows_enum::is_switchable_window(fg) {
+            state::with(|st| st.touch_recent(fg));
         }
 
         add_tray_icon(hwnd);
@@ -81,6 +91,7 @@ fn main() {
         // Cleanup.
         remove_tray_icon(hwnd);
         hook::uninstall();
+        win_event::uninstall();
     }
 }
 
