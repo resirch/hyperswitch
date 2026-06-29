@@ -53,7 +53,12 @@ extern "system" fn win_event_proc(
 ) {
     if event == EVENT_SYSTEM_FOREGROUND && !hwnd.0.is_null() {
         if windows_enum::is_switchable_window(hwnd) {
-            state::with(|st| st.touch_recent(hwnd));
+            state::with(|st| {
+                st.touch_recent(hwnd);
+                if !st.visible {
+                    st.refresh_all_windows();
+                }
+            });
         }
     }
 }

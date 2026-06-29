@@ -89,7 +89,7 @@ fn content_size(st: &AppState) -> (i32, i32) {
     (width, height)
 }
 
-/// Position and size the overlay for the current window count and show it.
+/// Position and size the overlay for the current window count.
 /// Pixel content is supplied separately by `render` via `UpdateLayeredWindow`.
 fn position_overlay(hwnd: HWND, st: &AppState) {
     unsafe {
@@ -110,7 +110,7 @@ fn position_overlay(hwnd: HWND, st: &AppState) {
             y,
             width,
             height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOACTIVATE,
         );
     }
 }
@@ -345,8 +345,10 @@ pub extern "system" fn wnd_proc(
                 LRESULT(0)
             }
             state::WM_HS_SHOW => {
+                // Size, paint, then show so the user never sees a stale frame.
                 state::with(|st| position_overlay(hwnd, st));
                 render(hwnd);
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 LRESULT(0)
             }
             state::WM_HS_UPDATE => {

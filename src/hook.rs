@@ -4,7 +4,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::state::{self, AppState};
-use crate::windows_enum::{close_window, cursor_monitor, enumerate_windows, window_monitor};
+use crate::windows_enum::close_window;
 
 thread_local! {
     static HOOK: Cell<HHOOK> = const { Cell::new(HHOOK(std::ptr::null_mut())) };
@@ -116,6 +116,7 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
                     let target = st.windows[idx].hwnd;
                     close_window(target);
                     st.windows.remove(idx);
+                    st.all_windows.retain(|w| w.hwnd.0 != target.0);
                     st.recent_hwnds.retain(|h| h.0 != target.0);
                     if st.windows.is_empty() {
                         st.visible = false;
@@ -155,19 +156,9 @@ fn handle_key(vk: u32, is_down: bool, is_up: bool) -> bool {
         if is_down && vk == cycle {
             if !st.visible {
                 if st.all_hold_mods_down() {
-                    let fresh = enumerate_windows();
                     let fg = unsafe { GetForegroundWindow() };
                     st.touch_recent(fg);
-                    let ordered = st.sort_by_recency(fresh);
-                    st.windows = if st.config.current_monitor_only {
-                        let cm = cursor_monitor();
-                        ordered
-                            .into_iter()
-                            .filter(|w| window_monitor(w.hwnd).0 == cm.0)
-                            .collect()
-                    } else {
-                        ordered
-                    };
+                    st.apply_display_filter();
                     if !st.windows.is_empty() {
                         st.selected = if st.windows.len() > 1 { 1 } else { 0 };
                         st.visible = true;

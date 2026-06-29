@@ -52,6 +52,7 @@ fn main() {
         state::init(AppState {
             overlay: hwnd,
             visible: false,
+            all_windows: Vec::new(),
             windows: Vec::new(),
             selected: 0,
             config,
@@ -73,11 +74,14 @@ fn main() {
             return;
         }
 
-        // Seed MRU with the current foreground window.
+        // Seed MRU and pre-build the sorted window list.
         let fg = GetForegroundWindow();
-        if windows_enum::is_switchable_window(fg) {
-            state::with(|st| st.touch_recent(fg));
-        }
+        state::with(|st| {
+            if windows_enum::is_switchable_window(fg) {
+                st.touch_recent(fg);
+            }
+            st.refresh_all_windows();
+        });
 
         add_tray_icon(hwnd);
 

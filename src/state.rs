@@ -28,6 +28,9 @@ pub enum ModKind {
 pub struct AppState {
     pub overlay: HWND,
     pub visible: bool,
+    /// Full MRU-sorted window list, kept current while the overlay is hidden.
+    pub all_windows: Vec<WindowInfo>,
+    /// Windows shown in the overlay (filtered view of `all_windows`).
     pub windows: Vec<WindowInfo>,
     pub selected: usize,
     pub config: Config,
@@ -109,6 +112,28 @@ impl AppState {
         }
         self.recent_hwnds.retain(|h| h.0 != hwnd.0);
         self.recent_hwnds.insert(0, hwnd);
+    }
+
+    /// Rebuild the cached window list from the live desktop and sort by MRU.
+    pub fn refresh_all_windows(&mut self) {
+        let fresh = crate::windows_enum::enumerate_windows();
+        self.all_windows = self.sort_by_recency(fresh);
+    }
+
+    /// Build the overlay row from the cached list (optionally filtered to the
+    /// cursor monitor). Cheap enough to call right before showing the overlay.
+    pub fn apply_display_filter(&mut self) {
+        if self.config.current_monitor_only {
+            let cm = crate::windows_enum::cursor_monitor();
+            self.windows = self
+                .all_windows
+                .iter()
+                .filter(|w| crate::windows_enum::window_monitor(w.hwnd).0 == cm.0)
+                .cloned()
+                .collect();
+        } else {
+            self.windows.clone_from(&self.all_windows);
+        }
     }
 
     /// Sort `fresh` by MRU order (most recently used first). Updates the tracked
