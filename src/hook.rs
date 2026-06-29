@@ -158,6 +158,7 @@ fn handle_key(vk: u32, is_down: bool, is_up: bool) -> bool {
                 if st.all_hold_mods_down() {
                     let fg = unsafe { GetForegroundWindow() };
                     st.touch_recent(fg);
+                    st.refresh_all_windows();
                     st.apply_display_filter();
                     if !st.windows.is_empty() {
                         st.selected = if st.windows.len() > 1 { 1 } else { 0 };
