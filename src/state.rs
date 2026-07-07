@@ -12,6 +12,7 @@ pub const WM_HS_UPDATE: u32 = WM_APP + 2;
 pub const WM_HS_HIDE: u32 = WM_APP + 3;
 pub const WM_HS_COMMIT: u32 = WM_APP + 4;
 pub const WM_HS_TRAY: u32 = WM_APP + 5;
+pub const WM_HS_INIT: u32 = WM_APP + 6;
 
 /// Aggregate which modifier the configured reverse key refers to.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,9 @@ pub struct AppState {
 
     /// Most-recently-used window order (front = most recent foreground).
     pub recent_hwnds: Vec<HWND>,
+
+    /// Guards against re-entrant refresh while win-event callbacks are active.
+    pub refreshing: bool,
 
     // Tracked physical modifier state (left/right tracked separately so that
     // releasing one side does not clear the other).
@@ -116,8 +120,13 @@ impl AppState {
 
     /// Rebuild the cached window list from the live desktop and sort by MRU.
     pub fn refresh_all_windows(&mut self) {
+        if self.refreshing {
+            return;
+        }
+        self.refreshing = true;
         let fresh = crate::windows_enum::enumerate_windows();
         self.all_windows = self.sort_by_recency(fresh);
+        self.refreshing = false;
     }
 
     /// Build the overlay row from the cached list (optionally filtered to the
@@ -184,4 +193,14 @@ pub fn init(state: AppState) {
 /// Run a closure with mutable access to the app state, if initialized.
 pub fn with<R>(f: impl FnOnce(&mut AppState) -> R) -> Option<R> {
     STATE.with(|s| s.borrow_mut().as_mut().map(f))
+}
+
+/// Like [`with`], but returns `None` if state is already borrowed (e.g. during
+/// a re-entrant win-event callback) instead of panicking.
+pub fn try_with<R>(f: impl FnOnce(&mut AppState) -> R) -> Option<R> {
+    STATE.with(|s| {
+        s.try_borrow_mut()
+            .ok()
+            .and_then(|mut guard| guard.as_mut().map(f))
+    })
 }

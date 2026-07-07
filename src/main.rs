@@ -4,6 +4,7 @@ mod config;
 mod focus;
 mod hook;
 mod icon_draw;
+mod input;
 mod overlay;
 mod startup;
 mod state;
@@ -57,6 +58,7 @@ fn main() {
             selected: 0,
             config,
             recent_hwnds: Vec::new(),
+            refreshing: false,
             lctrl: false,
             rctrl: false,
             lalt: false,
@@ -74,14 +76,15 @@ fn main() {
             return;
         }
 
-        // Seed MRU and pre-build the sorted window list.
+        // Seed MRU and build the window list on the message loop thread so
+        // hook/win-event callbacks never contend with startup enumeration.
         let fg = GetForegroundWindow();
         state::with(|st| {
             if windows_enum::is_switchable_window(fg) {
                 st.touch_recent(fg);
             }
-            st.refresh_all_windows();
         });
+        let _ = PostMessageW(Some(hwnd), state::WM_HS_INIT, WPARAM(0), LPARAM(0));
 
         add_tray_icon(hwnd);
 

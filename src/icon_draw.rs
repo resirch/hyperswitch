@@ -1,4 +1,5 @@
 use image::{imageops::FilterType, Rgba, RgbaImage};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -28,7 +29,35 @@ pub unsafe fn draw_icon_smooth(
     blend_rgba_over_premult(dest, dest_w, dest_h, x, y, &resized);
 }
 
+/// Scale an icon handle to the requested square size. Many game window icons
+/// are 16–32 px; DrawIconEx will not upscale them and they appear tiny in the
+/// corner unless we copy/scale the handle first.
+unsafe fn scaled_icon_handle(icon: HICON, size: i32) -> (HICON, bool) {
+    match CopyImage(
+        HANDLE(icon.0 as *mut _),
+        IMAGE_ICON,
+        size,
+        size,
+        LR_DEFAULTCOLOR,
+    ) {
+        Ok(scaled) if !scaled.is_invalid() => (HICON(scaled.0 as *mut _), true),
+        _ => (icon, false),
+    }
+}
+
 unsafe fn rasterize_icon(icon: HICON, size: i32) -> Option<RgbaImage> {
+    let (draw_icon, owned) = scaled_icon_handle(icon, size);
+
+    let result = rasterize_icon_handle(draw_icon, size);
+
+    if owned {
+        let _ = DestroyIcon(draw_icon);
+    }
+
+    result.map(|img| normalize_icon_content(&img, size as u32))
+}
+
+unsafe fn rasterize_icon_handle(icon: HICON, size: i32) -> Option<RgbaImage> {
     let screen = GetDC(None);
     if screen.is_invalid() {
         return None;
@@ -93,6 +122,59 @@ unsafe fn rasterize_icon(icon: HICON, size: i32) -> Option<RgbaImage> {
     ReleaseDC(None, screen);
 
     RgbaImage::from_raw(size as u32, size as u32, rgba)
+}
+
+/// Crop to visible pixels and scale the artwork to fill the square slot.
+fn normalize_icon_content(img: &RgbaImage, size: u32) -> RgbaImage {
+    let (min_x, min_y, max_x, max_y) = content_bounds(img);
+    if max_x <= min_x || max_y <= min_y {
+        return image::imageops::resize(img, size, size, FilterType::Lanczos3);
+    }
+
+    let w = max_x - min_x + 1;
+    let h = max_y - min_y + 1;
+
+    // Already fills the raster — just downscale to the display size later.
+    if w as f32 >= img.width() as f32 * 0.85 && h as f32 >= img.height() as f32 * 0.85 {
+        return img.clone();
+    }
+
+    let cropped = image::imageops::crop_imm(img, min_x, min_y, w, h).to_image();
+    let side = w.max(h).max(1);
+    let mut square = RgbaImage::new(side, side);
+    let ox = ((side - w) / 2) as i64;
+    let oy = ((side - h) / 2) as i64;
+    image::imageops::overlay(&mut square, &cropped, ox, oy);
+
+    let scaled = image::imageops::resize(&square, size, size, FilterType::Lanczos3);
+    let mut canvas = RgbaImage::new(size, size);
+    image::imageops::overlay(&mut canvas, &scaled, 0, 0);
+    canvas
+}
+
+fn content_bounds(img: &RgbaImage) -> (u32, u32, u32, u32) {
+    let mut min_x = u32::MAX;
+    let mut min_y = u32::MAX;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+
+    for y in 0..img.height() {
+        for x in 0..img.width() {
+            let Rgba([r, g, b, a]) = *img.get_pixel(x, y);
+            if a > 16 || (r | g | b) > 16 {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    if max_x < min_x {
+        (0, 0, 0, 0)
+    } else {
+        (min_x, min_y, max_x, max_y)
+    }
 }
 
 /// Porter-Duff "over" composite of an unpremultiplied RGBA icon onto a

@@ -3,6 +3,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::input;
 use crate::state::{self, AppState};
 use crate::windows_enum::close_window;
 
@@ -70,7 +71,7 @@ extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRES
 /// event. Clicking outside the icon row cancels the switch; left-clicking an
 /// icon selects and commits it; middle-clicking an icon closes that window.
 fn handle_mouse(msg: u32, pt: POINT) -> bool {
-    state::with(|st| {
+    state::try_with(|st| {
         if !st.visible {
             return false;
         }
@@ -145,7 +146,7 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
 
 /// Core state machine. Returns true if the key should be swallowed.
 fn handle_key(vk: u32, is_down: bool, is_up: bool) -> bool {
-    state::with(|st| {
+    state::try_with(|st| {
         // Modifier tracking must reflect this event before any decision.
         update_modifier(st, vk, is_down);
 
@@ -163,6 +164,9 @@ fn handle_key(vk: u32, is_down: bool, is_up: bool) -> bool {
                     if !st.windows.is_empty() {
                         st.selected = if st.windows.len() > 1 { 1 } else { 0 };
                         st.visible = true;
+                        unsafe {
+                            input::unlock_cursor();
+                        }
                         post(overlay, state::WM_HS_SHOW);
                         return true;
                     }

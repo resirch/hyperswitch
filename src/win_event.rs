@@ -76,23 +76,25 @@ extern "system" fn win_event_proc(
 
     match event {
         EVENT_SYSTEM_FOREGROUND => {
-            if windows_enum::is_switchable_window(hwnd) {
-                state::with(|st| {
-                    st.touch_recent(hwnd);
-                    if !st.visible {
-                        st.refresh_all_windows();
-                    }
-                });
+            if !windows_enum::is_switchable_window(hwnd) {
+                return;
             }
+            let _ = state::try_with(|st| {
+                st.touch_recent(hwnd);
+                if !st.visible {
+                    st.refresh_all_windows();
+                }
+            });
         }
         EVENT_OBJECT_DESTROY => {
-            state::with(|st| {
+            // Drop closed windows from the cache without a full re-enumerate
+            // (refresh during destroy events caused re-entrant crashes).
+            let _ = state::try_with(|st| {
                 if st.visible {
                     return;
                 }
-                if st.all_windows.iter().any(|w| w.hwnd.0 == hwnd.0) {
-                    st.refresh_all_windows();
-                }
+                st.all_windows.retain(|w| w.hwnd.0 != hwnd.0);
+                st.recent_hwnds.retain(|h| h.0 != hwnd.0);
             });
         }
         _ => {}

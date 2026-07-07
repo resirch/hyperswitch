@@ -9,7 +9,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::focus::focus_window;
 use crate::icon_draw;
+use crate::input;
 use crate::state::{self, AppState};
+use crate::windows_enum;
 
 // Layout constants (logical pixels).
 const MARGIN: i32 = 24;
@@ -217,7 +219,7 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) {
 
     std::ptr::write_bytes(bits as *mut u8, 0, (width as usize) * (height as usize) * 4);
 
-    let icon = st.config.icon_size;
+    let icon_sz = st.config.icon_size;
     let top = MARGIN;
 
     // Chrome (background, selection highlight, title) drawn opaque; GDI leaves
@@ -233,12 +235,12 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) {
     let _ = DeleteObject(bg.into());
 
     if st.selected < st.windows.len() {
-        let x = MARGIN + st.selected as i32 * (icon + ICON_GAP);
+        let x = MARGIN + st.selected as i32 * (icon_sz + ICON_GAP);
         let hl = RECT {
             left: x - HILITE_PAD,
             top: top - HILITE_PAD,
-            right: x + icon + HILITE_PAD,
-            bottom: top + icon + HILITE_PAD,
+            right: x + icon_sz + HILITE_PAD,
+            bottom: top + icon_sz + HILITE_PAD,
         };
         let hilite = CreateSolidBrush(COLORREF(0x00603C2E));
         let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00C08050));
@@ -257,7 +259,7 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) {
             title.push(0);
             let mut text_rc = RECT {
                 left: MARGIN,
-                top: MARGIN + icon + 6,
+                top: MARGIN + icon_sz + 6,
                 right: width - MARGIN,
                 bottom: height - 6,
             };
@@ -290,9 +292,13 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) {
     // Draw icons with Lanczos downscale and proper alpha compositing so edges
     // stay smooth on the premultiplied translucent background.
     for (i, win) in st.windows.iter().enumerate() {
-        if !win.icon.0.is_null() {
-            let x = MARGIN + i as i32 * (icon + ICON_GAP);
-            icon_draw::draw_icon_smooth(px, width, height, x, top, win.icon, icon);
+        let mut hicon = windows_enum::get_window_icon_for_display(win.hwnd);
+        if hicon.0.is_null() {
+            hicon = win.icon;
+        }
+        if !hicon.0.is_null() {
+            let x = MARGIN + i as i32 * (icon_sz + ICON_GAP);
+            icon_draw::draw_icon_smooth(px, width, height, x, top, hicon, icon_sz);
         }
     }
 
@@ -344,15 +350,23 @@ pub extern "system" fn wnd_proc(
                 let _ = ValidateRect(Some(hwnd), None);
                 LRESULT(0)
             }
+            state::WM_HS_INIT => {
+                state::with(|st| st.refresh_all_windows());
+                LRESULT(0)
+            }
             state::WM_HS_SHOW => {
-                // Size, paint, then show so the user never sees a stale frame.
+                // Size, paint, unlock cursor, raise above fullscreen, then show.
                 state::with(|st| position_overlay(hwnd, st));
                 render(hwnd);
+                input::unlock_cursor();
+                input::raise_overlay(hwnd);
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 LRESULT(0)
             }
             state::WM_HS_UPDATE => {
                 render(hwnd);
+                input::unlock_cursor();
+                input::raise_overlay(hwnd);
                 LRESULT(0)
             }
             state::WM_HS_HIDE => {

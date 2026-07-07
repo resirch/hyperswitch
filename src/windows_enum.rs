@@ -170,6 +170,30 @@ pub fn get_window_icon(hwnd: HWND) -> HICON {
     }
 }
 
+/// Prefer the window's own icon for display. Safe to call outside of
+/// `EnumWindows` (e.g. while painting the overlay). SendMessage during
+/// enumeration caused intermittent startup crashes.
+pub fn get_window_icon_for_display(hwnd: HWND) -> HICON {
+    unsafe {
+        for icon_type in [ICON_BIG, ICON_SMALL2, ICON_SMALL] {
+            let mut result: usize = 0;
+            let _ = SendMessageTimeoutW(
+                hwnd,
+                WM_GETICON,
+                WPARAM(icon_type as usize),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                120,
+                Some(&mut result as *mut usize),
+            );
+            if result != 0 {
+                return HICON(result as *mut _);
+            }
+        }
+        HICON::default()
+    }
+}
+
 const ICON_SMALL: i32 = 0;
 const ICON_BIG: i32 = 1;
 const ICON_SMALL2: i32 = 2;
