@@ -7,8 +7,46 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 /// Higher values produce smoother anti-aliased edges at the display size.
 const RASTER_SIZE: i32 = 256;
 
-/// Rasterize an HICON to RGBA at `RASTER_SIZE`, downscale with Lanczos, and
-/// alpha-composite it onto a premultiplied-ARGB destination buffer.
+/// Pick the sharpest icon source: high-res cached jumbo icons for normal apps,
+/// small window-specific icons for games that would otherwise stamp tiny in a
+/// corner.
+pub unsafe fn pick_icon_for_draw(cached: HICON, hwnd: windows::Win32::Foundation::HWND) -> HICON {
+    if cached.0.is_null() {
+        return crate::windows_enum::get_window_icon_for_display(hwnd);
+    }
+    let window = crate::windows_enum::get_window_icon_for_display(hwnd);
+    if window.0.is_null() {
+        return cached;
+    }
+
+    let wm = icon_max_dimension(window);
+    let cm = icon_max_dimension(cached);
+    if wm == 0 {
+        return cached;
+    }
+    if cm == 0 {
+        return window;
+    }
+
+    // Small title-bar icon vs. a much larger cached shell icon: keep the sharp
+    // downscale unless the cached handle would draw as a tiny centered stamp.
+    if wm <= 48 && cm > 128 {
+        if icon_content_is_tiny(cached, RASTER_SIZE) {
+            return window;
+        }
+        return cached;
+    }
+
+    // Both handles are small — prefer the window-specific artwork.
+    if wm <= 48 && cm <= 64 {
+        return window;
+    }
+
+    cached
+}
+
+/// Rasterize an HICON to RGBA, then resize with Lanczos and alpha-composite
+/// onto a premultiplied-ARGB destination buffer.
 pub unsafe fn draw_icon_smooth(
     dest: &mut [u32],
     dest_w: i32,
@@ -22,22 +60,28 @@ pub unsafe fn draw_icon_smooth(
         return;
     }
 
-    let Some(source) = rasterize_icon(icon, RASTER_SIZE) else {
+    let Some(source) = rasterize_icon(icon, size) else {
         return;
     };
-    let resized = image::imageops::resize(&source, size as u32, size as u32, FilterType::Lanczos3);
+    let resized = if source.width() == size as u32 && source.height() == size as u32 {
+        source
+    } else {
+        image::imageops::resize(&source, size as u32, size as u32, FilterType::Lanczos3)
+    };
     blend_rgba_over_premult(dest, dest_w, dest_h, x, y, &resized);
 }
 
-/// Scale an icon handle to the requested square size. Many game window icons
-/// are 16–32 px; DrawIconEx will not upscale them and they appear tiny in the
-/// corner unless we copy/scale the handle first.
-unsafe fn scaled_icon_handle(icon: HICON, size: i32) -> (HICON, bool) {
+/// Upscale only when the native handle is smaller than the raster target.
+unsafe fn scaled_icon_handle(icon: HICON, target: i32) -> (HICON, bool) {
+    let native = icon_max_dimension(icon) as i32;
+    if native >= target {
+        return (icon, false);
+    }
     match CopyImage(
         HANDLE(icon.0 as *mut _),
         IMAGE_ICON,
-        size,
-        size,
+        target,
+        target,
         LR_DEFAULTCOLOR,
     ) {
         Ok(scaled) if !scaled.is_invalid() => (HICON(scaled.0 as *mut _), true),
@@ -45,16 +89,71 @@ unsafe fn scaled_icon_handle(icon: HICON, size: i32) -> (HICON, bool) {
     }
 }
 
-unsafe fn rasterize_icon(icon: HICON, size: i32) -> Option<RgbaImage> {
-    let (draw_icon, owned) = scaled_icon_handle(icon, size);
+unsafe fn rasterize_icon(icon: HICON, display_size: i32) -> Option<RgbaImage> {
+    let native = icon_max_dimension(icon) as i32;
+    let raster_size = if native >= RASTER_SIZE {
+        RASTER_SIZE
+    } else if native >= display_size {
+        native.max(1)
+    } else {
+        display_size
+    };
 
-    let result = rasterize_icon_handle(draw_icon, size);
+    let (draw_icon, owned) = scaled_icon_handle(icon, raster_size);
+    let result = rasterize_icon_handle(draw_icon, raster_size);
 
     if owned {
         let _ = DestroyIcon(draw_icon);
     }
 
-    result.map(|img| normalize_icon_content(&img, size as u32))
+    result.map(|img| normalize_icon_content(&img, raster_size as u32))
+}
+
+unsafe fn icon_max_dimension(icon: HICON) -> u32 {
+    if icon.0.is_null() {
+        return 0;
+    }
+    let mut info = ICONINFO::default();
+    if GetIconInfo(icon, &mut info).is_err() {
+        return 0;
+    }
+    let dim = icon_bitmap_max_dimension(info.hbmColor).max(icon_bitmap_max_dimension(info.hbmMask));
+    if !info.hbmColor.is_invalid() {
+        let _ = DeleteObject(info.hbmColor.into());
+    }
+    if !info.hbmMask.is_invalid() {
+        let _ = DeleteObject(info.hbmMask.into());
+    }
+    dim
+}
+
+unsafe fn icon_bitmap_max_dimension(hbm: HBITMAP) -> u32 {
+    if hbm.is_invalid() {
+        return 0;
+    }
+    let mut bm = BITMAP::default();
+    let got = GetObjectW(
+        hbm.into(),
+        std::mem::size_of::<BITMAP>() as i32,
+        Some(&mut bm as *mut _ as *mut _),
+    );
+    if got == 0 {
+        return 0;
+    }
+    bm.bmWidth.unsigned_abs().max(bm.bmHeight.unsigned_abs())
+}
+
+unsafe fn icon_content_is_tiny(icon: HICON, raster: i32) -> bool {
+    let Some(img) = rasterize_icon_handle(icon, raster) else {
+        return false;
+    };
+    let (min_x, min_y, max_x, max_y) = content_bounds(&img);
+    if max_x <= min_x {
+        return true;
+    }
+    let w = max_x - min_x + 1;
+    let h = max_y - min_y + 1;
+    (w.max(h) as f32) < (raster as f32 * 0.45)
 }
 
 unsafe fn rasterize_icon_handle(icon: HICON, size: i32) -> Option<RgbaImage> {
@@ -133,9 +232,12 @@ fn normalize_icon_content(img: &RgbaImage, size: u32) -> RgbaImage {
 
     let w = max_x - min_x + 1;
     let h = max_y - min_y + 1;
+    let content_max = w.max(h);
+    let canvas_max = img.width().max(img.height());
 
-    // Already fills the raster — just downscale to the display size later.
-    if w as f32 >= img.width() as f32 * 0.85 && h as f32 >= img.height() as f32 * 0.85 {
+    // Only upscale artwork that is genuinely tiny inside the raster (games).
+    // Icons with normal padding should keep the high-res Lanczos downscale path.
+    if content_max as f32 >= canvas_max as f32 * 0.45 {
         return img.clone();
     }
 

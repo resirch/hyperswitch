@@ -11,7 +11,6 @@ use crate::focus::focus_window;
 use crate::icon_draw;
 use crate::input;
 use crate::state::{self, AppState};
-use crate::windows_enum;
 
 // Layout constants (logical pixels).
 const MARGIN: i32 = 24;
@@ -292,10 +291,7 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) {
     // Draw icons with Lanczos downscale and proper alpha compositing so edges
     // stay smooth on the premultiplied translucent background.
     for (i, win) in st.windows.iter().enumerate() {
-        let mut hicon = windows_enum::get_window_icon_for_display(win.hwnd);
-        if hicon.0.is_null() {
-            hicon = win.icon;
-        }
+        let hicon = icon_draw::pick_icon_for_draw(win.icon, win.hwnd);
         if !hicon.0.is_null() {
             let x = MARGIN + i as i32 * (icon_sz + ICON_GAP);
             icon_draw::draw_icon_smooth(px, width, height, x, top, hicon, icon_sz);
