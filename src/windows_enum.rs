@@ -22,6 +22,19 @@ pub struct WindowInfo {
     pub hwnd: HWND,
     pub title: String,
     pub icon: HICON,
+    /// True when this process owns `icon` and must call `DestroyIcon` on drop.
+    pub icon_owned: bool,
+}
+
+/// Release icons created by shell APIs (`SHGetFileInfo`, image list, etc.).
+pub fn free_window_icons(windows: &[WindowInfo]) {
+    unsafe {
+        for w in windows {
+            if w.icon_owned && !w.icon.0.is_null() {
+                let _ = DestroyIcon(w.icon);
+            }
+        }
+    }
 }
 
 /// Enumerate all alt-tab-able windows in top-to-bottom Z-order.
@@ -40,8 +53,13 @@ extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
             let list = &mut *(lparam.0 as *mut Vec<WindowInfo>);
             let title = get_window_title(hwnd);
             if !title.is_empty() {
-                let icon = get_window_icon(hwnd);
-                list.push(WindowInfo { hwnd, title, icon });
+                let (icon, icon_owned) = get_window_icon_with_ownership(hwnd);
+                list.push(WindowInfo {
+                    hwnd,
+                    title,
+                    icon,
+                    icon_owned,
+                });
             }
         }
     }
@@ -128,12 +146,12 @@ pub fn get_window_title(hwnd: HWND) -> String {
 /// large system image-list icon for the owning exe) so the icon stays sharp
 /// when drawn scaled down. Falls back to the window's own icon, the class icon,
 /// and finally the standard large exe icon.
-pub fn get_window_icon(hwnd: HWND) -> HICON {
+fn get_window_icon_with_ownership(hwnd: HWND) -> (HICON, bool) {
     unsafe {
         // 1. High-res icon from the system image list (256px jumbo / 48px
         //    extra-large), downscaled cleanly by DrawIconEx.
         if let Some(icon) = jumbo_exe_icon(hwnd) {
-            return icon;
+            return (icon, true);
         }
 
         // 2. The window's own icon (big, then small variants).
@@ -149,7 +167,7 @@ pub fn get_window_icon(hwnd: HWND) -> HICON {
                 Some(&mut result as *mut usize),
             );
             if result != 0 {
-                return HICON(result as *mut _);
+                return (HICON(result as *mut _), false);
             }
         }
 
@@ -157,16 +175,16 @@ pub fn get_window_icon(hwnd: HWND) -> HICON {
         for idx in [GCLP_HICON, GCLP_HICONSM] {
             let handle = GetClassLongPtrW(hwnd, idx);
             if handle != 0 {
-                return HICON(handle as *mut _);
+                return (HICON(handle as *mut _), false);
             }
         }
 
         // 4. The standard large process executable icon.
         if let Some(icon) = exe_icon(hwnd) {
-            return icon;
+            return (icon, true);
         }
 
-        HICON::default()
+        (HICON::default(), false)
     }
 }
 

@@ -1,9 +1,9 @@
 use std::cell::Cell;
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_OBJECT_DESTROY, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT,
+    PostMessageW, EVENT_OBJECT_DESTROY, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT,
 };
 
 use crate::state;
@@ -81,8 +81,19 @@ extern "system" fn win_event_proc(
             }
             let _ = state::try_with(|st| {
                 st.touch_recent(hwnd);
-                if !st.visible {
-                    st.refresh_all_windows();
+                st.refresh_all_windows();
+                if st.visible {
+                    if st.selected >= st.windows.len() && !st.windows.is_empty() {
+                        st.selected = st.windows.len() - 1;
+                    }
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(st.overlay),
+                            state::WM_HS_UPDATE,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
                 }
             });
         }
@@ -90,11 +101,37 @@ extern "system" fn win_event_proc(
             // Drop closed windows from the cache without a full re-enumerate
             // (refresh during destroy events caused re-entrant crashes).
             let _ = state::try_with(|st| {
-                if st.visible {
-                    return;
+                if let Some(pos) = st.all_windows.iter().position(|w| w.hwnd.0 == hwnd.0) {
+                    let removed = st.all_windows.remove(pos);
+                    windows_enum::free_window_icons(std::slice::from_ref(&removed));
                 }
-                st.all_windows.retain(|w| w.hwnd.0 != hwnd.0);
                 st.recent_hwnds.retain(|h| h.0 != hwnd.0);
+                if st.visible {
+                    st.apply_display_filter();
+                    if st.windows.is_empty() {
+                        st.visible = false;
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(st.overlay),
+                                state::WM_HS_HIDE,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    } else {
+                        if st.selected >= st.windows.len() {
+                            st.selected = st.windows.len() - 1;
+                        }
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(st.overlay),
+                                state::WM_HS_UPDATE,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                }
             });
         }
         _ => {}

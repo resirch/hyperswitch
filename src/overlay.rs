@@ -166,25 +166,28 @@ fn cursor_monitor_work_area() -> RECT {
 }
 
 /// Rebuild the overlay's pixels and push them to the screen via
-/// `UpdateLayeredWindow`. The background keeps the configured translucency;
-/// app icons are drawn with Lanczos downscaling for smooth anti-aliased edges.
-fn render(hwnd: HWND) {
-    state::with(|st| unsafe {
-        if !st.windows.is_empty() {
-            draw_layered(hwnd, st);
+/// `UpdateLayeredWindow`. Returns false if the frame could not be painted
+/// (usually GDI resource exhaustion after leaking handles).
+fn render_layered(hwnd: HWND) -> bool {
+    state::with(|st| {
+        if st.windows.is_empty() {
+            false
+        } else {
+            unsafe { draw_layered(hwnd, st) }
         }
-    });
+    })
+    .unwrap_or(false)
 }
 
-unsafe fn draw_layered(hwnd: HWND, st: &AppState) {
+unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
     let mut rc = RECT::default();
     if GetWindowRect(hwnd, &mut rc).is_err() {
-        return;
+        return false;
     }
     let width = rc.right - rc.left;
     let height = rc.bottom - rc.top;
     if width <= 0 || height <= 0 {
-        return;
+        return false;
     }
 
     let screen = GetDC(None);
@@ -209,7 +212,7 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) {
         _ => {
             let _ = DeleteDC(mem_dc);
             ReleaseDC(None, screen);
-            return;
+            return false;
         }
     };
     let old = SelectObject(mem_dc, dib.into());
@@ -315,7 +318,7 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) {
         SourceConstantAlpha: 255,
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
-    let _ = UpdateLayeredWindow(
+    let ok = UpdateLayeredWindow(
         hwnd,
         Some(screen),
         Some(&pt_dst),
@@ -325,12 +328,14 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) {
         COLORREF(0),
         Some(&blend),
         ULW_ALPHA,
-    );
+    )
+    .is_ok();
 
     SelectObject(mem_dc, old);
     let _ = DeleteObject(dib.into());
     let _ = DeleteDC(mem_dc);
     ReleaseDC(None, screen);
+    ok
 }
 
 pub extern "system" fn wnd_proc(
@@ -353,16 +358,25 @@ pub extern "system" fn wnd_proc(
             state::WM_HS_SHOW => {
                 // Size, paint, unlock cursor, raise above fullscreen, then show.
                 state::with(|st| position_overlay(hwnd, st));
-                render(hwnd);
-                input::unlock_cursor();
-                input::raise_overlay(hwnd);
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                if !render_layered(hwnd) {
+                    state::with(|st| st.visible = false);
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                } else {
+                    input::unlock_cursor();
+                    input::raise_overlay(hwnd);
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
                 LRESULT(0)
             }
             state::WM_HS_UPDATE => {
-                render(hwnd);
-                input::unlock_cursor();
-                input::raise_overlay(hwnd);
+                state::with(|st| position_overlay(hwnd, st));
+                if !render_layered(hwnd) {
+                    state::with(|st| st.visible = false);
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                } else {
+                    input::unlock_cursor();
+                    input::raise_overlay(hwnd);
+                }
                 LRESULT(0)
             }
             state::WM_HS_HIDE => {

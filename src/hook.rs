@@ -5,7 +5,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::input;
 use crate::state::{self, AppState};
-use crate::windows_enum::close_window;
+use crate::windows_enum::{self, close_window};
 
 thread_local! {
     static HOOK: Cell<HHOOK> = const { Cell::new(HHOOK(std::ptr::null_mut())) };
@@ -114,10 +114,12 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
             }
             WM_MBUTTONDOWN => {
                 if let Some(idx) = hit {
-                    let target = st.windows[idx].hwnd;
+                    let removed = st.windows[idx].clone();
+                    let target = removed.hwnd;
                     close_window(target);
                     st.windows.remove(idx);
                     st.all_windows.retain(|w| w.hwnd.0 != target.0);
+                    windows_enum::free_window_icons(std::slice::from_ref(&removed));
                     st.recent_hwnds.retain(|h| h.0 != target.0);
                     if st.windows.is_empty() {
                         st.visible = false;
@@ -160,7 +162,6 @@ fn handle_key(vk: u32, is_down: bool, is_up: bool) -> bool {
                     let fg = unsafe { GetForegroundWindow() };
                     st.touch_recent(fg);
                     st.refresh_all_windows();
-                    st.apply_display_filter();
                     if !st.windows.is_empty() {
                         st.selected = if st.windows.len() > 1 { 1 } else { 0 };
                         st.visible = true;

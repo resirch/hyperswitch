@@ -125,7 +125,9 @@ impl AppState {
         }
         self.refreshing = true;
         let fresh = crate::windows_enum::enumerate_windows();
+        crate::windows_enum::free_window_icons(&self.all_windows);
         self.all_windows = self.sort_by_recency(fresh);
+        self.apply_display_filter();
         self.refreshing = false;
     }
 
