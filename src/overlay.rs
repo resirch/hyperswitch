@@ -5,6 +5,7 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::focus::focus_window;
@@ -12,11 +13,104 @@ use crate::icon_draw;
 use crate::input;
 use crate::state::{self, AppState};
 
-// Layout constants (logical pixels).
+// Base layout constants at 96 DPI (100% scaling).
+const DEFAULT_DPI: u32 = 96;
 const MARGIN: i32 = 24;
 const ICON_GAP: i32 = 18;
 const TITLE_HEIGHT: i32 = 44;
 const HILITE_PAD: i32 = 8;
+const CORNER_RADIUS: i32 = 12;
+const TEXT_PAD: i32 = 6;
+const TITLE_FONT_PX: i32 = 16;
+
+/// DPI-scaled overlay geometry shared by positioning, drawing, and hit-testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayLayout {
+    dpi: u32,
+    count: usize,
+    margin: i32,
+    icon_gap: i32,
+    hilite_pad: i32,
+    icon_size: i32,
+    corner_radius: i32,
+    border_width: i32,
+    text_pad: i32,
+    width: i32,
+    height: i32,
+}
+
+impl OverlayLayout {
+    fn new(logical_icon_size: i32, show_title: bool, count: usize, dpi: u32) -> Self {
+        let dpi = if dpi == 0 { DEFAULT_DPI } else { dpi };
+        let margin = scale_dpi(MARGIN, dpi);
+        let icon_gap = scale_dpi(ICON_GAP, dpi);
+        let title_height = scale_dpi(TITLE_HEIGHT, dpi);
+        let hilite_pad = scale_dpi(HILITE_PAD, dpi);
+        let icon_size = scale_dpi(logical_icon_size, dpi).max(1);
+        let corner_radius = scale_dpi(CORNER_RADIUS, dpi);
+        let border_width = scale_dpi(1, dpi).max(1);
+        let text_pad = scale_dpi(TEXT_PAD, dpi);
+
+        let n = count as i32;
+        let width = if n > 0 {
+            margin * 2 + n * icon_size + (n - 1) * icon_gap
+        } else {
+            margin * 2
+        };
+        let height = if show_title {
+            margin * 2 + icon_size + title_height
+        } else {
+            margin * 2 + icon_size
+        };
+
+        Self {
+            dpi,
+            count,
+            margin,
+            icon_gap,
+            hilite_pad,
+            icon_size,
+            corner_radius,
+            border_width,
+            text_pad,
+            width,
+            height,
+        }
+    }
+
+    fn item_x(&self, index: usize) -> i32 {
+        self.margin + index as i32 * (self.icon_size + self.icon_gap)
+    }
+
+    fn item_highlight_rect(&self, index: usize) -> RECT {
+        let x = self.item_x(index);
+        let top = self.margin;
+        RECT {
+            left: x - self.hilite_pad,
+            top: top - self.hilite_pad,
+            right: x + self.icon_size + self.hilite_pad,
+            bottom: top + self.icon_size + self.hilite_pad,
+        }
+    }
+
+    fn hit_test(&self, cx: i32, cy: i32) -> Option<usize> {
+        let top = self.margin;
+        if cy < top - self.hilite_pad || cy > top + self.icon_size + self.hilite_pad {
+            return None;
+        }
+        for i in 0..self.count {
+            let hl = self.item_highlight_rect(i);
+            if cx >= hl.left && cx <= hl.right {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+fn scale_dpi(px: i32, dpi: u32) -> i32 {
+    ((px as i64 * dpi as i64 + (DEFAULT_DPI as i64 / 2)) / DEFAULT_DPI as i64) as i32
+}
 
 pub const CLASS_NAME: PCWSTR = w!("HyperswitchOverlay");
 
@@ -76,78 +170,79 @@ pub fn create_overlay() -> windows::core::Result<HWND> {
     }
 }
 
-/// Overlay pixel size for the current window count. Height drops the title
-/// strip when titles are hidden so there is no empty gap below the icons.
-fn content_size(st: &AppState) -> (i32, i32) {
-    let n = st.windows.len() as i32;
-    let icon = st.config.icon_size;
-    let width = MARGIN * 2 + n * icon + (n - 1) * ICON_GAP;
-    let height = if st.config.show_title {
-        MARGIN * 2 + icon + TITLE_HEIGHT
-    } else {
-        MARGIN * 2 + icon
-    };
-    (width, height)
-}
-
-/// Position and size the overlay for the current window count.
-/// Pixel content is supplied separately by `render` via `UpdateLayeredWindow`.
-fn position_overlay(hwnd: HWND, st: &AppState) {
+/// Position and size the overlay centered on `hmon` using that monitor's DPI.
+/// Pixel content is supplied separately by `render_layered` via `UpdateLayeredWindow`.
+fn position_overlay_on_monitor(hwnd: HWND, st: &mut AppState, hmon: HMONITOR) {
     unsafe {
         if st.windows.is_empty() {
             return;
         }
-        let (width, height) = content_size(st);
+        let dpi = monitor_dpi(hmon);
+        let layout = OverlayLayout::new(
+            st.config.icon_size,
+            st.config.show_title,
+            st.windows.len(),
+            dpi,
+        );
 
-        // Center on the monitor under the cursor (nicer multi-monitor UX).
-        let area = cursor_monitor_work_area();
-        let x = area.left + (area.right - area.left - width) / 2;
-        let y = area.top + (area.bottom - area.top - height) / 2;
+        let area = monitor_work_area(hmon);
+        let x = area.left + (area.right - area.left - layout.width) / 2;
+        let y = area.top + (area.bottom - area.top - layout.height) / 2;
 
+        st.overlay_dpi = dpi;
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
             x,
             y,
-            width,
-            height,
+            layout.width,
+            layout.height,
             SWP_NOACTIVATE,
         );
     }
 }
 
-/// Hit-test a screen point against the icon row. Returns the index of the item
-/// under the point, if any. `icon` is the configured icon edge length and
-/// `count` the number of windows currently shown. Does not touch shared state,
+/// Hit-test a per-monitor-aware screen point against the icon row. Returns the
+/// index of the item under the point, if any. `icon` is the configured logical
+/// icon edge length, `count` the number of windows currently shown, and `dpi`
+/// the monitor DPI used to lay out the overlay. Does not touch shared state,
 /// so it is safe to call from within a `state::with` closure.
-pub fn item_index_at(hwnd: HWND, icon: i32, count: usize, pt: POINT) -> Option<usize> {
+pub fn item_index_at(
+    hwnd: HWND,
+    icon: i32,
+    count: usize,
+    dpi: u32,
+    pt: POINT,
+) -> Option<usize> {
     unsafe {
+        if count == 0 || !IsWindowVisible(hwnd).as_bool() {
+            return None;
+        }
         let mut rc = RECT::default();
         if GetWindowRect(hwnd, &mut rc).is_err() {
             return None;
         }
-        let cx = pt.x - rc.left;
-        let cy = pt.y - rc.top;
-        let top = MARGIN;
-        if cy < top - HILITE_PAD || cy > top + icon + HILITE_PAD {
-            return None;
-        }
-        for i in 0..count {
-            let x = MARGIN + i as i32 * (icon + ICON_GAP);
-            if cx >= x - HILITE_PAD && cx <= x + icon + HILITE_PAD {
-                return Some(i);
-            }
-        }
-        None
+        let layout = OverlayLayout::new(icon, false, count, dpi);
+        layout.hit_test(pt.x - rc.left, pt.y - rc.top)
     }
 }
 
-/// Work area (excludes taskbar) of the monitor under the mouse cursor.
-fn cursor_monitor_work_area() -> RECT {
+/// Effective DPI for `hmon`, falling back to standard 96 DPI.
+fn monitor_dpi(hmon: HMONITOR) -> u32 {
     unsafe {
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut dpi_x = DEFAULT_DPI;
+        let mut dpi_y = DEFAULT_DPI;
+        if GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() && dpi_x > 0 {
+            dpi_x
+        } else {
+            DEFAULT_DPI
+        }
+    }
+}
+
+/// Work area (excludes taskbar) of `hmon` in physical screen coordinates.
+fn monitor_work_area(hmon: HMONITOR) -> RECT {
+    unsafe {
         let mut mi = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
@@ -190,6 +285,13 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
         return false;
     }
 
+    let layout = OverlayLayout::new(
+        st.config.icon_size,
+        st.config.show_title,
+        st.windows.len(),
+        st.overlay_dpi,
+    );
+
     let screen = GetDC(None);
     let mem_dc = CreateCompatibleDC(Some(screen));
 
@@ -221,8 +323,8 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
 
     std::ptr::write_bytes(bits as *mut u8, 0, (width as usize) * (height as usize) * 4);
 
-    let icon_sz = st.config.icon_size;
-    let top = MARGIN;
+    let icon_sz = layout.icon_size;
+    let top = layout.margin;
 
     // Chrome (background, selection highlight, title) drawn opaque; GDI leaves
     // the alpha byte at 0, which the fixup pass below turns into translucency.
@@ -237,18 +339,20 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
     let _ = DeleteObject(bg.into());
 
     if st.selected < st.windows.len() {
-        let x = MARGIN + st.selected as i32 * (icon_sz + ICON_GAP);
-        let hl = RECT {
-            left: x - HILITE_PAD,
-            top: top - HILITE_PAD,
-            right: x + icon_sz + HILITE_PAD,
-            bottom: top + icon_sz + HILITE_PAD,
-        };
+        let hl = layout.item_highlight_rect(st.selected);
         let hilite = CreateSolidBrush(COLORREF(0x00603C2E));
-        let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00C08050));
+        let pen = CreatePen(PS_SOLID, layout.border_width, COLORREF(0x00C08050));
         let old_pen = SelectObject(mem_dc, pen.into());
         let old_brush = SelectObject(mem_dc, hilite.into());
-        let _ = RoundRect(mem_dc, hl.left, hl.top, hl.right, hl.bottom, 12, 12);
+        let _ = RoundRect(
+            mem_dc,
+            hl.left,
+            hl.top,
+            hl.right,
+            hl.bottom,
+            layout.corner_radius,
+            layout.corner_radius,
+        );
         SelectObject(mem_dc, old_brush);
         SelectObject(mem_dc, old_pen);
         let _ = DeleteObject(hilite.into());
@@ -260,10 +364,31 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
             let mut title: Vec<u16> = win.title.encode_utf16().collect();
             title.push(0);
             let mut text_rc = RECT {
-                left: MARGIN,
-                top: MARGIN + icon_sz + 6,
-                right: width - MARGIN,
-                bottom: height - 6,
+                left: layout.margin,
+                top: layout.margin + icon_sz + layout.text_pad,
+                right: width - layout.margin,
+                bottom: height - layout.text_pad,
+            };
+            let font = CreateFontW(
+                -scale_dpi(TITLE_FONT_PX, layout.dpi),
+                0,
+                0,
+                0,
+                FW_NORMAL.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                ANTIALIASED_QUALITY,
+                (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
+                w!("Segoe UI"),
+            );
+            let old_font = if !font.0.is_null() {
+                Some(SelectObject(mem_dc, font.into()))
+            } else {
+                None
             };
             SetBkMode(mem_dc, TRANSPARENT);
             SetTextColor(mem_dc, COLORREF(0x00F0F0F0));
@@ -273,6 +398,10 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
                 &mut text_rc,
                 DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
             );
+            if let Some(prev) = old_font {
+                SelectObject(mem_dc, prev);
+                let _ = DeleteObject(font.into());
+            }
         }
     }
 
@@ -296,7 +425,7 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
     for (i, win) in st.windows.iter().enumerate() {
         let hicon = icon_draw::pick_icon_for_draw(win.icon, win.hwnd);
         if !hicon.0.is_null() {
-            let x = MARGIN + i as i32 * (icon_sz + ICON_GAP);
+            let x = layout.item_x(i);
             icon_draw::draw_icon_smooth(px, width, height, x, top, hicon, icon_sz);
         }
     }
@@ -357,7 +486,8 @@ pub extern "system" fn wnd_proc(
             }
             state::WM_HS_SHOW => {
                 // Size, paint, unlock cursor, raise above fullscreen, then show.
-                state::with(|st| position_overlay(hwnd, st));
+                let hmon = crate::windows_enum::cursor_monitor();
+                state::with(|st| position_overlay_on_monitor(hwnd, st, hmon));
                 if !render_layered(hwnd) {
                     state::with(|st| st.visible = false);
                     let _ = ShowWindow(hwnd, SW_HIDE);
@@ -369,7 +499,29 @@ pub extern "system" fn wnd_proc(
                 LRESULT(0)
             }
             state::WM_HS_UPDATE => {
-                state::with(|st| position_overlay(hwnd, st));
+                // Keep the overlay on its current monitor and only reposition
+                // when window count or DPI changed.
+                let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                state::with(|st| {
+                    if st.windows.is_empty() {
+                        return;
+                    }
+                    let dpi = monitor_dpi(hmon);
+                    let layout = OverlayLayout::new(
+                        st.config.icon_size,
+                        st.config.show_title,
+                        st.windows.len(),
+                        dpi,
+                    );
+                    let mut rc = RECT::default();
+                    let matches = GetWindowRect(hwnd, &mut rc).is_ok()
+                        && (rc.right - rc.left) == layout.width
+                        && (rc.bottom - rc.top) == layout.height
+                        && st.overlay_dpi == dpi;
+                    if !matches {
+                        position_overlay_on_monitor(hwnd, st, hmon);
+                    }
+                });
                 if !render_layered(hwnd) {
                     state::with(|st| st.visible = false);
                     let _ = ShowWindow(hwnd, SW_HIDE);
@@ -411,6 +563,75 @@ pub extern "system" fn wnd_proc(
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_matches_base_metrics_at_96_dpi() {
+        let layout = OverlayLayout::new(64, true, 4, 96);
+        assert_eq!(layout.margin, 24);
+        assert_eq!(layout.icon_gap, 18);
+        assert_eq!(layout.icon_size, 64);
+        assert_eq!(layout.hilite_pad, 8);
+        assert_eq!(layout.width, 24 * 2 + 4 * 64 + 3 * 18);
+        assert_eq!(layout.height, 24 * 2 + 64 + 44);
+    }
+
+    #[test]
+    fn layout_scales_and_hit_tests_accurately_at_144_dpi() {
+        let layout = OverlayLayout::new(64, true, 4, 144);
+        assert_eq!(layout.margin, 36);
+        assert_eq!(layout.icon_gap, 27);
+        assert_eq!(layout.icon_size, 96);
+        assert_eq!(layout.hilite_pad, 12);
+        assert_eq!(layout.width, 36 * 2 + 4 * 96 + 3 * 27);
+        assert_eq!(layout.height, 36 * 2 + 96 + 66);
+
+        for i in 0..4 {
+            let hl = layout.item_highlight_rect(i);
+            let mid_x = (hl.left + hl.right) / 2;
+            let mid_y = (hl.top + hl.bottom) / 2;
+            assert_eq!(layout.hit_test(mid_x, mid_y), Some(i));
+            assert_eq!(layout.hit_test(hl.left, hl.top), Some(i));
+            assert_eq!(layout.hit_test(hl.right, hl.bottom), Some(i));
+        }
+
+        // Above, below, and in the narrow gap between highlight boxes should miss.
+        let first = layout.item_highlight_rect(0);
+        let second = layout.item_highlight_rect(1);
+        assert_eq!(layout.hit_test(first.left, first.top - 1), None);
+        assert_eq!(layout.hit_test(first.left, first.bottom + 1), None);
+        assert!(second.left - first.right > 1);
+        assert_eq!(
+            layout.hit_test((first.right + second.left) / 2, (first.top + first.bottom) / 2),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_dpi_falls_back_to_default() {
+        let layout = OverlayLayout::new(64, false, 2, 0);
+        assert_eq!(layout.dpi, DEFAULT_DPI);
+        assert_eq!(layout.icon_size, 64);
+    }
+
+    #[test]
+    fn embedded_manifest_enables_per_monitor_v2_dpi_awareness() {
+        use windows::Win32::UI::HiDpi::{
+            AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        unsafe {
+            let ctx = GetThreadDpiAwarenessContext();
+            assert!(
+                AreDpiAwarenessContextsEqual(ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+                    .as_bool()
+            );
         }
     }
 }

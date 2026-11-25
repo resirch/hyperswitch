@@ -75,6 +75,12 @@ fn main() {
       </requestedPrivileges>
     </security>
   </trustInfo>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
 </assembly>"#,
     );
     // Force the resource compiler to rebuild when the icon hash changes.
