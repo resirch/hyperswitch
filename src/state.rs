@@ -28,6 +28,8 @@ pub enum ModKind {
 /// thread-local is sufficient and avoids `Send`/`Sync` issues with raw HWNDs.
 pub struct AppState {
     pub overlay: HWND,
+    /// Effective DPI of the monitor where the overlay was last positioned.
+    pub overlay_dpi: u32,
     pub visible: bool,
     /// Full MRU-sorted window list, kept current while the overlay is hidden.
     pub all_windows: Vec<WindowInfo>,

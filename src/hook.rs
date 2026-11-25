@@ -80,6 +80,7 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
             overlay,
             st.config.icon_size,
             st.windows.len(),
+            st.overlay_dpi,
             pt,
         );
 

@@ -15,6 +15,10 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
@@ -32,6 +36,12 @@ const ID_TRAY_STARTUP: u32 = 1005;
 
 fn main() {
     unsafe {
+        // Use per-monitor-v2 DPI awareness so GetWindowRect, monitor metrics,
+        // and WH_MOUSE_LL's physical cursor coordinates share one coordinate space.
+        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_err() {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+        }
+
         // Single instance guard.
         let _mutex = CreateMutexW(None, true, w!("Global\\HyperswitchSingleInstance"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
@@ -52,6 +62,7 @@ fn main() {
 
         state::init(AppState {
             overlay: hwnd,
+            overlay_dpi: 96,
             visible: false,
             all_windows: Vec::new(),
             windows: Vec::new(),
