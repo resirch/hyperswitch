@@ -157,15 +157,18 @@ fn get_window_icon_with_ownership(hwnd: HWND) -> (HICON, bool) {
         // 2. The window's own icon (big, then small variants).
         for icon_type in [ICON_BIG, ICON_SMALL2, ICON_SMALL] {
             let mut result: usize = 0;
-            let _ = SendMessageTimeoutW(
+            let sent = SendMessageTimeoutW(
                 hwnd,
                 WM_GETICON,
                 WPARAM(icon_type as usize),
                 LPARAM(0),
                 SMTO_ABORTIFHUNG,
-                120,
+                WM_GETICON_TIMEOUT_MS,
                 Some(&mut result as *mut usize),
             );
+            if sent.0 == 0 {
+                break;
+            }
             if result != 0 {
                 return (HICON(result as *mut _), false);
             }
@@ -188,6 +191,8 @@ fn get_window_icon_with_ownership(hwnd: HWND) -> (HICON, bool) {
     }
 }
 
+const WM_GETICON_TIMEOUT_MS: u32 = 30;
+
 /// Prefer the window's own icon for display. Safe to call outside of
 /// `EnumWindows` (e.g. while painting the overlay). SendMessage during
 /// enumeration caused intermittent startup crashes.
@@ -195,15 +200,18 @@ pub fn get_window_icon_for_display(hwnd: HWND) -> HICON {
     unsafe {
         for icon_type in [ICON_BIG, ICON_SMALL2, ICON_SMALL] {
             let mut result: usize = 0;
-            let _ = SendMessageTimeoutW(
+            let sent = SendMessageTimeoutW(
                 hwnd,
                 WM_GETICON,
                 WPARAM(icon_type as usize),
                 LPARAM(0),
                 SMTO_ABORTIFHUNG,
-                120,
+                WM_GETICON_TIMEOUT_MS,
                 Some(&mut result as *mut usize),
             );
+            if sent.0 == 0 {
+                break;
+            }
             if result != 0 {
                 return HICON(result as *mut _);
             }

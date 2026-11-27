@@ -3,6 +3,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::focus;
 use crate::input;
 use crate::state::{self, AppState};
 use crate::windows_enum::{self, close_window};
@@ -42,6 +43,9 @@ extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> L
     unsafe {
         if code >= 0 {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+            if kb.dwExtraInfo == focus::SYNTHETIC_KEY_EXTRA_INFO {
+                return CallNextHookEx(None, code, wparam, lparam);
+            }
             let vk = kb.vkCode;
             let msg = wparam.0 as u32;
             let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
@@ -88,9 +92,11 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
             WM_LBUTTONDOWN => {
                 if let Some(idx) = hit {
                     st.selected = idx;
+                    st.pending_commit = st.windows.get(idx).map(|w| w.hwnd);
                     st.visible = false;
                     post(overlay, state::WM_HS_COMMIT);
                 } else {
+                    st.pending_commit = None;
                     st.visible = false;
                     post(overlay, state::WM_HS_HIDE);
                 }
@@ -98,6 +104,7 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
             }
             WM_RBUTTONDOWN => {
                 // Any right click cancels.
+                st.pending_commit = None;
                 st.visible = false;
                 post(overlay, state::WM_HS_HIDE);
                 true
@@ -120,9 +127,10 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
                     close_window(target);
                     st.windows.remove(idx);
                     st.all_windows.retain(|w| w.hwnd.0 != target.0);
-                    windows_enum::free_window_icons(std::slice::from_ref(&removed));
+                    st.release_window_icon(&removed);
                     st.recent_hwnds.retain(|h| h.0 != target.0);
                     if st.windows.is_empty() {
+                        st.pending_commit = None;
                         st.visible = false;
                         post(overlay, state::WM_HS_HIDE);
                     } else {
@@ -132,10 +140,12 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
                         if st.selected >= st.windows.len() {
                             st.selected = st.windows.len() - 1;
                         }
-                        // Re-show to resize for the new count and repaint.
-                        post(overlay, state::WM_HS_SHOW);
+                        // Resize for the new count and repaint without re-enumerating
+                        // the window that was just sent WM_CLOSE asynchronously.
+                        post(overlay, state::WM_HS_UPDATE);
                     }
                 } else {
+                    st.pending_commit = None;
                     st.visible = false;
                     post(overlay, state::WM_HS_HIDE);
                 }
@@ -150,7 +160,10 @@ fn handle_mouse(msg: u32, pt: POINT) -> bool {
 /// Core state machine. Returns true if the key should be swallowed.
 fn handle_key(vk: u32, is_down: bool, is_up: bool) -> bool {
     state::try_with(|st| {
-        // Modifier tracking must reflect this event before any decision.
+        // Reconcile tracked modifiers with Windows' authoritative live key
+        // state, then apply this in-flight event (GetAsyncKeyState has not
+        // yet updated for `vk` while WH_KEYBOARD_LL is running).
+        sync_modifiers_from_os(st);
         update_modifier(st, vk, is_down);
 
         let overlay = st.overlay;
@@ -161,17 +174,21 @@ fn handle_key(vk: u32, is_down: bool, is_up: bool) -> bool {
             if !st.visible {
                 if st.all_hold_mods_down() {
                     let fg = unsafe { GetForegroundWindow() };
-                    st.touch_recent(fg);
-                    st.refresh_all_windows();
-                    if !st.windows.is_empty() {
-                        st.selected = if st.windows.len() > 1 { 1 } else { 0 };
-                        st.visible = true;
-                        unsafe {
-                            input::unlock_cursor();
-                        }
-                        post(overlay, state::WM_HS_SHOW);
-                        return true;
+                    if windows_enum::is_switchable_window(fg) {
+                        st.touch_recent(fg);
                     }
+                    // Keep WH_KEYBOARD_LL fast (<1ms): use the cached MRU list
+                    // immediately and let WM_HS_SHOW refresh asynchronously off
+                    // the hook path.
+                    st.prepare_cached_windows();
+                    st.pending_commit = None;
+                    st.selected = if st.windows.len() > 1 { 1 } else { 0 };
+                    st.visible = true;
+                    unsafe {
+                        input::unlock_cursor();
+                    }
+                    post(overlay, state::WM_HS_SHOW);
+                    return true;
                 }
                 return false;
             } else {
@@ -207,6 +224,7 @@ fn handle_key(vk: u32, is_down: bool, is_up: bool) -> bool {
                     post(overlay, state::WM_HS_UPDATE);
                 }
                 VK_ESCAPE => {
+                    st.pending_commit = None;
                     st.visible = false;
                     post(overlay, state::WM_HS_HIDE);
                 }
@@ -220,13 +238,17 @@ fn handle_key(vk: u32, is_down: bool, is_up: bool) -> bool {
         // Another shortcut while the overlay is open (e.g. hyper+Space for an app
         // launcher): cancel without committing and let the key through.
         if st.visible && is_down && should_cancel_on_other_key(st, vk, cycle) {
+            st.pending_commit = None;
             st.visible = false;
             post(overlay, state::WM_HS_HIDE);
             return false;
         }
 
-        // Commit on hold-modifier release: the core fix.
-        if is_up && st.visible && is_modifier_vk(vk) && !st.any_hold_mod_held() {
+        // Commit as soon as no configured hold-modifier remains held (checked on
+        // any key-up so even a missed modifier-up followed by cycle-key-up still
+        // commits immediately).
+        if is_up && st.visible && !st.any_hold_mod_held() {
+            st.pending_commit = st.windows.get(st.selected).map(|w| w.hwnd);
             st.visible = false;
             post(overlay, state::WM_HS_COMMIT);
         }
@@ -242,28 +264,99 @@ fn post(hwnd: HWND, msg: u32) {
     }
 }
 
+unsafe fn async_key_down(vk: VIRTUAL_KEY) -> bool {
+    (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0
+}
+
+/// Sync all tracked modifier flags directly from Windows' authoritative live
+/// async key state so a missed key-up (UAC, lock screen, exclusive fullscreen
+/// transition, or hook timeout) can never leave a modifier stuck down.
+pub fn sync_modifiers_from_os(st: &mut AppState) {
+    unsafe {
+        st.lctrl = async_key_down(VK_LCONTROL);
+        st.rctrl = async_key_down(VK_RCONTROL);
+        st.gctrl = !st.lctrl && !st.rctrl && async_key_down(VK_CONTROL);
+
+        st.lalt = async_key_down(VK_LMENU);
+        st.ralt = async_key_down(VK_RMENU);
+        st.galt = !st.lalt && !st.ralt && async_key_down(VK_MENU);
+
+        st.lwin = async_key_down(VK_LWIN);
+        st.rwin = async_key_down(VK_RWIN);
+
+        st.lshift = async_key_down(VK_LSHIFT);
+        st.rshift = async_key_down(VK_RSHIFT);
+        st.gshift = !st.lshift && !st.rshift && async_key_down(VK_SHIFT);
+    }
+}
+
 fn update_modifier(st: &mut AppState, vk: u32, is_down: bool) {
     let key = VIRTUAL_KEY(vk as u16);
     match key {
-        VK_LCONTROL => st.lctrl = is_down,
-        VK_RCONTROL => st.rctrl = is_down,
-        VK_CONTROL => {
+        VK_LCONTROL => {
             st.lctrl = is_down;
-            st.rctrl = is_down;
+            if !is_down {
+                st.gctrl = false;
+            }
         }
-        VK_LMENU => st.lalt = is_down,
-        VK_RMENU => st.ralt = is_down,
-        VK_MENU => {
+        VK_RCONTROL => {
+            st.rctrl = is_down;
+            if !is_down {
+                st.gctrl = false;
+            }
+        }
+        VK_CONTROL => {
+            if is_down {
+                st.gctrl = true;
+            } else {
+                st.lctrl = false;
+                st.rctrl = false;
+                st.gctrl = false;
+            }
+        }
+        VK_LMENU => {
             st.lalt = is_down;
+            if !is_down {
+                st.galt = false;
+            }
+        }
+        VK_RMENU => {
             st.ralt = is_down;
+            if !is_down {
+                st.galt = false;
+            }
+        }
+        VK_MENU => {
+            if is_down {
+                st.galt = true;
+            } else {
+                st.lalt = false;
+                st.ralt = false;
+                st.galt = false;
+            }
         }
         VK_LWIN => st.lwin = is_down,
         VK_RWIN => st.rwin = is_down,
-        VK_LSHIFT => st.lshift = is_down,
-        VK_RSHIFT => st.rshift = is_down,
-        VK_SHIFT => {
+        VK_LSHIFT => {
             st.lshift = is_down;
+            if !is_down {
+                st.gshift = false;
+            }
+        }
+        VK_RSHIFT => {
             st.rshift = is_down;
+            if !is_down {
+                st.gshift = false;
+            }
+        }
+        VK_SHIFT => {
+            if is_down {
+                st.gshift = true;
+            } else {
+                st.lshift = false;
+                st.rshift = false;
+                st.gshift = false;
+            }
         }
         _ => {}
     }
@@ -312,5 +405,85 @@ fn is_reverse_modifier_vk(st: &AppState, vk: u32) -> bool {
         "win" | "windows" | "super" => matches!(key, VK_LWIN | VK_RWIN),
         "shift" => matches!(key, VK_SHIFT | VK_LSHIFT | VK_RSHIFT),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn test_state() -> AppState {
+        AppState {
+            overlay: HWND(std::ptr::null_mut()),
+            overlay_dpi: 96,
+            visible: false,
+            all_windows: Vec::new(),
+            windows: Vec::new(),
+            selected: 0,
+            pending_commit: None,
+            config: Config::default(),
+            recent_hwnds: Vec::new(),
+            refreshing: false,
+            refresh_pending: false,
+            rendering: false,
+            stale_icons: Vec::new(),
+            lctrl: false,
+            rctrl: false,
+            gctrl: false,
+            lalt: false,
+            ralt: false,
+            galt: false,
+            lwin: false,
+            rwin: false,
+            lshift: false,
+            rshift: false,
+            gshift: false,
+        }
+    }
+
+    #[test]
+    fn generic_alt_down_does_not_stick_right_alt_after_left_alt_release() {
+        let mut st = test_state();
+        update_modifier(&mut st, VK_MENU.0 as u32, true);
+        assert!(st.alt());
+        assert!(!st.ralt);
+
+        update_modifier(&mut st, VK_LMENU.0 as u32, false);
+        assert!(!st.alt());
+        assert!(!st.any_hold_mod_held());
+    }
+
+    #[test]
+    fn left_and_right_modifiers_release_independently() {
+        let mut st = test_state();
+        update_modifier(&mut st, VK_LCONTROL.0 as u32, true);
+        update_modifier(&mut st, VK_RCONTROL.0 as u32, true);
+        update_modifier(&mut st, VK_LMENU.0 as u32, true);
+        update_modifier(&mut st, VK_LWIN.0 as u32, true);
+        assert!(st.all_hold_mods_down());
+
+        update_modifier(&mut st, VK_LCONTROL.0 as u32, false);
+        update_modifier(&mut st, VK_LMENU.0 as u32, false);
+        update_modifier(&mut st, VK_LWIN.0 as u32, false);
+        // Right control is still held.
+        assert!(st.any_hold_mod_held());
+
+        update_modifier(&mut st, VK_RCONTROL.0 as u32, false);
+        assert!(!st.any_hold_mod_held());
+    }
+
+    #[test]
+    fn generic_modifiers_activate_and_release_cleanly() {
+        let mut st = test_state();
+        update_modifier(&mut st, VK_CONTROL.0 as u32, true);
+        update_modifier(&mut st, VK_MENU.0 as u32, true);
+        update_modifier(&mut st, VK_LWIN.0 as u32, true);
+        assert!(st.all_hold_mods_down());
+
+        update_modifier(&mut st, VK_CONTROL.0 as u32, false);
+        update_modifier(&mut st, VK_MENU.0 as u32, false);
+        update_modifier(&mut st, VK_LWIN.0 as u32, false);
+        assert!(!st.any_hold_mod_held());
     }
 }

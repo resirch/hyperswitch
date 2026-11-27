@@ -4,9 +4,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, SetActiveWindow, SetFocus, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, SetForegroundWindow,
-    ShowWindow, SW_RESTORE,
+    BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindow,
+    SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
+
+/// Tag passed in `dwExtraInfo` for our synthetic ALT tap so the low-level
+/// keyboard hook ignores our own injected events instead of mutating modifier
+/// tracking.
+pub const SYNTHETIC_KEY_EXTRA_INFO: usize = 0x4853_594E;
 
 /// Reliably bring `target` to the foreground, working around Windows'
 /// foreground-lock restrictions by attaching to the current foreground thread
@@ -17,6 +22,10 @@ pub fn focus_window(target: HWND) {
     }
 
     unsafe {
+        if !IsWindow(Some(target)).as_bool() {
+            return;
+        }
+
         // Restore if minimized.
         if IsIconic(target).as_bool() {
             let _ = ShowWindow(target, SW_RESTORE);
@@ -32,8 +41,18 @@ pub fn focus_window(target: HWND) {
         let target_thread = GetWindowThreadProcessId(target, None);
 
         // Synthetic ALT tap relaxes the foreground lock for this call.
-        keybd_event(VK_MENU.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(
+            VK_MENU.0 as u8,
+            0,
+            KEYBD_EVENT_FLAGS(0),
+            SYNTHETIC_KEY_EXTRA_INFO,
+        );
+        keybd_event(
+            VK_MENU.0 as u8,
+            0,
+            KEYEVENTF_KEYUP,
+            SYNTHETIC_KEY_EXTRA_INFO,
+        );
 
         let attached_fg = fg_thread != 0 && fg_thread != our_thread;
         let attached_tg = target_thread != 0 && target_thread != our_thread && target_thread != fg_thread;

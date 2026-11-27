@@ -81,15 +81,15 @@ extern "system" fn win_event_proc(
             }
             let _ = state::try_with(|st| {
                 st.touch_recent(hwnd);
-                st.refresh_all_windows();
-                if st.visible {
-                    if st.selected >= st.windows.len() && !st.windows.is_empty() {
-                        st.selected = st.windows.len() - 1;
-                    }
+                // Defer full window enumeration to the message loop so we never
+                // hold STATE borrowed across cross-thread SendMessageTimeoutW
+                // or shell calls inside a WinEvent callback.
+                if !st.refresh_pending {
+                    st.refresh_pending = true;
                     unsafe {
                         let _ = PostMessageW(
                             Some(st.overlay),
-                            state::WM_HS_UPDATE,
+                            state::WM_HS_REFRESH,
                             WPARAM(0),
                             LPARAM(0),
                         );
@@ -103,12 +103,13 @@ extern "system" fn win_event_proc(
             let _ = state::try_with(|st| {
                 if let Some(pos) = st.all_windows.iter().position(|w| w.hwnd.0 == hwnd.0) {
                     let removed = st.all_windows.remove(pos);
-                    windows_enum::free_window_icons(std::slice::from_ref(&removed));
+                    st.release_window_icon(&removed);
                 }
                 st.recent_hwnds.retain(|h| h.0 != hwnd.0);
                 if st.visible {
                     st.apply_display_filter();
                     if st.windows.is_empty() {
+                        st.pending_commit = None;
                         st.visible = false;
                         unsafe {
                             let _ = PostMessageW(

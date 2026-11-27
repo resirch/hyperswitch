@@ -14,31 +14,40 @@ pub unsafe fn pick_icon_for_draw(cached: HICON, hwnd: windows::Win32::Foundation
     if cached.0.is_null() {
         return crate::windows_enum::get_window_icon_for_display(hwnd);
     }
+
+    let cm = icon_max_dimension(cached);
+    if cm == 0 {
+        let window = crate::windows_enum::get_window_icon_for_display(hwnd);
+        if window.0.is_null() || icon_max_dimension(window) == 0 {
+            return cached;
+        }
+        return window;
+    }
+
+    // Only query WM_GETICON when we might actually prefer the window's own
+    // icon (small cached handle, or tiny artwork stamped inside a jumbo icon).
+    // Skipping WM_GETICON for normal sharp jumbo icons avoids cross-thread
+    // stalls against fullscreen or busy windows.
+    let need_window_icon = if cm > 128 {
+        icon_content_is_tiny(cached, RASTER_SIZE)
+    } else {
+        cm <= 64
+    };
+    if !need_window_icon {
+        return cached;
+    }
+
     let window = crate::windows_enum::get_window_icon_for_display(hwnd);
     if window.0.is_null() {
         return cached;
     }
 
     let wm = icon_max_dimension(window);
-    let cm = icon_max_dimension(cached);
     if wm == 0 {
         return cached;
     }
-    if cm == 0 {
-        return window;
-    }
 
-    // Small title-bar icon vs. a much larger cached shell icon: keep the sharp
-    // downscale unless the cached handle would draw as a tiny centered stamp.
-    if wm <= 48 && cm > 128 {
-        if icon_content_is_tiny(cached, RASTER_SIZE) {
-            return window;
-        }
-        return cached;
-    }
-
-    // Both handles are small — prefer the window-specific artwork.
-    if wm <= 48 && cm <= 64 {
+    if wm <= 48 {
         return window;
     }
 

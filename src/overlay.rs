@@ -9,9 +9,11 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::focus::focus_window;
+use crate::hook;
 use crate::icon_draw;
 use crate::input;
-use crate::state::{self, AppState};
+use crate::state;
+use crate::windows_enum::WindowInfo;
 
 // Base layout constants at 96 DPI (100% scaling).
 const DEFAULT_DPI: u32 = 96;
@@ -112,6 +114,12 @@ fn scale_dpi(px: i32, dpi: u32) -> i32 {
     ((px as i64 * dpi as i64 + (DEFAULT_DPI as i64 / 2)) / DEFAULT_DPI as i64) as i32
 }
 
+/// Watchdog timer active only while the overlay is open. Recovers cleanly if
+/// the OS drops a modifier key-up (e.g. UAC, exclusive fullscreen transition,
+/// or low-level hook timeout).
+const TIMER_MOD_CHECK: usize = 1;
+const MOD_CHECK_INTERVAL_MS: u32 = 50;
+
 pub const CLASS_NAME: PCWSTR = w!("HyperswitchOverlay");
 
 /// Register the overlay window class. Called once at startup.
@@ -172,24 +180,31 @@ pub fn create_overlay() -> windows::core::Result<HWND> {
 
 /// Position and size the overlay centered on `hmon` using that monitor's DPI.
 /// Pixel content is supplied separately by `render_layered` via `UpdateLayeredWindow`.
-fn position_overlay_on_monitor(hwnd: HWND, st: &mut AppState, hmon: HMONITOR) {
-    unsafe {
+fn position_overlay_on_monitor(hwnd: HWND, hmon: HMONITOR) {
+    let dpi = monitor_dpi(hmon);
+    let layout = state::with(|st| {
         if st.windows.is_empty() {
-            return;
+            None
+        } else {
+            st.overlay_dpi = dpi;
+            Some(OverlayLayout::new(
+                st.config.icon_size,
+                st.config.show_title,
+                st.windows.len(),
+                dpi,
+            ))
         }
-        let dpi = monitor_dpi(hmon);
-        let layout = OverlayLayout::new(
-            st.config.icon_size,
-            st.config.show_title,
-            st.windows.len(),
-            dpi,
-        );
+    })
+    .flatten();
+    let Some(layout) = layout else {
+        return;
+    };
 
+    unsafe {
         let area = monitor_work_area(hmon);
         let x = area.left + (area.right - area.left - layout.width) / 2;
         let y = area.top + (area.bottom - area.top - layout.height) / 2;
 
-        st.overlay_dpi = dpi;
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -199,6 +214,37 @@ fn position_overlay_on_monitor(hwnd: HWND, st: &mut AppState, hmon: HMONITOR) {
             layout.height,
             SWP_NOACTIVATE,
         );
+    }
+}
+
+/// Keep the overlay on its current monitor and only reposition when window
+/// count or DPI changed.
+fn reposition_if_needed(hwnd: HWND) {
+    let hmon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let dpi = monitor_dpi(hmon);
+    let mut rc = RECT::default();
+    let have_rect = unsafe { GetWindowRect(hwnd, &mut rc).is_ok() };
+
+    let needs_reposition = state::with(|st| {
+        if st.windows.is_empty() {
+            return false;
+        }
+        let layout = OverlayLayout::new(
+            st.config.icon_size,
+            st.config.show_title,
+            st.windows.len(),
+            dpi,
+        );
+        let matches = have_rect
+            && (rc.right - rc.left) == layout.width
+            && (rc.bottom - rc.top) == layout.height
+            && st.overlay_dpi == dpi;
+        !matches
+    })
+    .unwrap_or(false);
+
+    if needs_reposition {
+        position_overlay_on_monitor(hwnd, hmon);
     }
 }
 
@@ -260,21 +306,60 @@ fn monitor_work_area(hmon: HMONITOR) -> RECT {
     }
 }
 
+struct RenderSnapshot {
+    windows: Vec<WindowInfo>,
+    selected: usize,
+    icon_size: i32,
+    show_title: bool,
+    opacity: u8,
+    overlay_dpi: u32,
+}
+
 /// Rebuild the overlay's pixels and push them to the screen via
 /// `UpdateLayeredWindow`. Returns false if the frame could not be painted
 /// (usually GDI resource exhaustion after leaking handles).
+///
+/// Snapshots state first so `STATE` is not borrowed across `draw_layered`
+/// (which may invoke cross-thread `SendMessageTimeoutW` for window icons and
+/// pump low-level hooks re-entrantly).
 fn render_layered(hwnd: HWND) -> bool {
-    state::with(|st| {
+    let snapshot = state::with(|st| {
         if st.windows.is_empty() {
-            false
-        } else {
-            unsafe { draw_layered(hwnd, st) }
+            return None;
         }
+        st.rendering = true;
+        Some(RenderSnapshot {
+            windows: st.windows.clone(),
+            selected: st.selected,
+            icon_size: st.config.icon_size,
+            show_title: st.config.show_title,
+            opacity: st.config.opacity,
+            overlay_dpi: st.overlay_dpi,
+        })
     })
-    .unwrap_or(false)
+    .flatten();
+
+    let Some(snap) = snapshot else {
+        return false;
+    };
+
+    let ok = unsafe { draw_layered(hwnd, &snap) };
+
+    let stale = state::with(|st| {
+        st.rendering = false;
+        std::mem::take(&mut st.stale_icons)
+    })
+    .unwrap_or_default();
+    for hicon in stale {
+        unsafe {
+            let _ = DestroyIcon(hicon);
+        }
+    }
+
+    ok
 }
 
-unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
+unsafe fn draw_layered(hwnd: HWND, snap: &RenderSnapshot) -> bool {
     let mut rc = RECT::default();
     if GetWindowRect(hwnd, &mut rc).is_err() {
         return false;
@@ -286,10 +371,10 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
     }
 
     let layout = OverlayLayout::new(
-        st.config.icon_size,
-        st.config.show_title,
-        st.windows.len(),
-        st.overlay_dpi,
+        snap.icon_size,
+        snap.show_title,
+        snap.windows.len(),
+        snap.overlay_dpi,
     );
 
     let screen = GetDC(None);
@@ -338,8 +423,8 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
     FillRect(mem_dc, &full, bg);
     let _ = DeleteObject(bg.into());
 
-    if st.selected < st.windows.len() {
-        let hl = layout.item_highlight_rect(st.selected);
+    if snap.selected < snap.windows.len() {
+        let hl = layout.item_highlight_rect(snap.selected);
         let hilite = CreateSolidBrush(COLORREF(0x00603C2E));
         let pen = CreatePen(PS_SOLID, layout.border_width, COLORREF(0x00C08050));
         let old_pen = SelectObject(mem_dc, pen.into());
@@ -359,8 +444,8 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
         let _ = DeleteObject(pen.into());
     }
 
-    if st.config.show_title {
-        if let Some(win) = st.windows.get(st.selected) {
+    if snap.show_title {
+        if let Some(win) = snap.windows.get(snap.selected) {
             let mut title: Vec<u16> = win.title.encode_utf16().collect();
             title.push(0);
             let mut text_rc = RECT {
@@ -409,7 +494,7 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
 
     // Give all chrome pixels the configured opacity and premultiply their RGB,
     // producing a valid premultiplied-ARGB translucent background.
-    let opacity = st.config.opacity as u32;
+    let opacity = snap.opacity as u32;
     let pixels = (width as usize) * (height as usize);
     let px = std::slice::from_raw_parts_mut(bits as *mut u32, pixels);
     for p in px.iter_mut() {
@@ -422,7 +507,7 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
 
     // Draw icons with Lanczos downscale and proper alpha compositing so edges
     // stay smooth on the premultiplied translucent background.
-    for (i, win) in st.windows.iter().enumerate() {
+    for (i, win) in snap.windows.iter().enumerate() {
         let hicon = icon_draw::pick_icon_for_draw(win.icon, win.hwnd);
         if !hicon.0.is_null() {
             let x = layout.item_x(i);
@@ -467,6 +552,93 @@ unsafe fn draw_layered(hwnd: HWND, st: &AppState) -> bool {
     ok
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverlayCheck {
+    Continue,
+    Skip,
+    Commit,
+}
+
+/// Verify the overlay should still be shown and that at least one hold
+/// modifier is physically down according to Windows' live key state.
+fn check_visible_and_modifiers() -> OverlayCheck {
+    state::with(|st| {
+        if !st.visible {
+            return OverlayCheck::Skip;
+        }
+        hook::sync_modifiers_from_os(st);
+        if !st.any_hold_mod_held() {
+            st.pending_commit = st.windows.get(st.selected).map(|w| w.hwnd);
+            st.visible = false;
+            return OverlayCheck::Commit;
+        }
+        OverlayCheck::Continue
+    })
+    .unwrap_or(OverlayCheck::Skip)
+}
+
+unsafe fn hide_overlay(hwnd: HWND) {
+    let _ = KillTimer(Some(hwnd), TIMER_MOD_CHECK);
+    let _ = ShowWindow(hwnd, SW_HIDE);
+}
+
+unsafe fn commit_pending(hwnd: HWND) {
+    let _ = KillTimer(Some(hwnd), TIMER_MOD_CHECK);
+    let target = state::with(|st| {
+        st.visible = false;
+        st.pending_commit.take()
+    })
+    .flatten();
+    let _ = ShowWindow(hwnd, SW_HIDE);
+    if let Some(target) = target {
+        focus_window(target);
+    }
+}
+
+unsafe fn update_visible_overlay(hwnd: HWND) {
+    match check_visible_and_modifiers() {
+        OverlayCheck::Skip => return,
+        OverlayCheck::Commit => {
+            commit_pending(hwnd);
+            return;
+        }
+        OverlayCheck::Continue => {}
+    }
+
+    let empty = state::with(|st| st.windows.is_empty()).unwrap_or(true);
+    if empty {
+        state::with(|st| {
+            st.pending_commit = None;
+            st.visible = false;
+        });
+        hide_overlay(hwnd);
+        return;
+    }
+
+    reposition_if_needed(hwnd);
+    let ok = render_layered(hwnd);
+
+    match check_visible_and_modifiers() {
+        OverlayCheck::Skip => return,
+        OverlayCheck::Commit => {
+            commit_pending(hwnd);
+            return;
+        }
+        OverlayCheck::Continue => {}
+    }
+
+    if !ok {
+        state::with(|st| {
+            st.pending_commit = None;
+            st.visible = false;
+        });
+        hide_overlay(hwnd);
+    } else {
+        input::unlock_cursor();
+        input::raise_overlay(hwnd);
+    }
+}
+
 pub extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -481,67 +653,97 @@ pub extern "system" fn wnd_proc(
                 LRESULT(0)
             }
             state::WM_HS_INIT => {
-                state::with(|st| st.refresh_all_windows());
+                state::refresh_all_windows_unlocked();
+                LRESULT(0)
+            }
+            state::WM_HS_REFRESH => {
+                state::with(|st| st.refresh_pending = false);
+                state::refresh_all_windows_unlocked();
+                if state::with(|st| st.visible).unwrap_or(false) {
+                    update_visible_overlay(hwnd);
+                }
                 LRESULT(0)
             }
             state::WM_HS_SHOW => {
+                match check_visible_and_modifiers() {
+                    OverlayCheck::Skip => return LRESULT(0),
+                    OverlayCheck::Commit => {
+                        commit_pending(hwnd);
+                        return LRESULT(0);
+                    }
+                    OverlayCheck::Continue => {}
+                }
+
+                // Refresh live window list off the keyboard hook thread without
+                // holding STATE borrowed during enumeration.
+                state::refresh_all_windows_unlocked();
+
+                match check_visible_and_modifiers() {
+                    OverlayCheck::Skip => return LRESULT(0),
+                    OverlayCheck::Commit => {
+                        commit_pending(hwnd);
+                        return LRESULT(0);
+                    }
+                    OverlayCheck::Continue => {}
+                }
+
+                let empty = state::with(|st| st.windows.is_empty()).unwrap_or(true);
+                if empty {
+                    state::with(|st| {
+                        st.pending_commit = None;
+                        st.visible = false;
+                    });
+                    hide_overlay(hwnd);
+                    return LRESULT(0);
+                }
+
                 // Size, paint, unlock cursor, raise above fullscreen, then show.
                 let hmon = crate::windows_enum::cursor_monitor();
-                state::with(|st| position_overlay_on_monitor(hwnd, st, hmon));
-                if !render_layered(hwnd) {
-                    state::with(|st| st.visible = false);
-                    let _ = ShowWindow(hwnd, SW_HIDE);
+                position_overlay_on_monitor(hwnd, hmon);
+                let ok = render_layered(hwnd);
+
+                match check_visible_and_modifiers() {
+                    OverlayCheck::Skip => return LRESULT(0),
+                    OverlayCheck::Commit => {
+                        commit_pending(hwnd);
+                        return LRESULT(0);
+                    }
+                    OverlayCheck::Continue => {}
+                }
+
+                if !ok {
+                    state::with(|st| {
+                        st.pending_commit = None;
+                        st.visible = false;
+                    });
+                    hide_overlay(hwnd);
                 } else {
                     input::unlock_cursor();
                     input::raise_overlay(hwnd);
                     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    let _ = SetTimer(Some(hwnd), TIMER_MOD_CHECK, MOD_CHECK_INTERVAL_MS, None);
                 }
                 LRESULT(0)
             }
             state::WM_HS_UPDATE => {
-                // Keep the overlay on its current monitor and only reposition
-                // when window count or DPI changed.
-                let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                state::with(|st| {
-                    if st.windows.is_empty() {
-                        return;
-                    }
-                    let dpi = monitor_dpi(hmon);
-                    let layout = OverlayLayout::new(
-                        st.config.icon_size,
-                        st.config.show_title,
-                        st.windows.len(),
-                        dpi,
-                    );
-                    let mut rc = RECT::default();
-                    let matches = GetWindowRect(hwnd, &mut rc).is_ok()
-                        && (rc.right - rc.left) == layout.width
-                        && (rc.bottom - rc.top) == layout.height
-                        && st.overlay_dpi == dpi;
-                    if !matches {
-                        position_overlay_on_monitor(hwnd, st, hmon);
-                    }
-                });
-                if !render_layered(hwnd) {
-                    state::with(|st| st.visible = false);
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                } else {
-                    input::unlock_cursor();
-                    input::raise_overlay(hwnd);
-                }
+                update_visible_overlay(hwnd);
                 LRESULT(0)
             }
             state::WM_HS_HIDE => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+                hide_overlay(hwnd);
                 LRESULT(0)
             }
             state::WM_HS_COMMIT => {
-                let target = state::with(|st| {
-                    st.windows.get(st.selected).map(|w| w.hwnd)
-                });
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                if let Some(Some(target)) = target {
-                    focus_window(target);
+                commit_pending(hwnd);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_MOD_CHECK => {
+                match check_visible_and_modifiers() {
+                    OverlayCheck::Commit => commit_pending(hwnd),
+                    OverlayCheck::Skip => {
+                        let _ = KillTimer(Some(hwnd), TIMER_MOD_CHECK);
+                    }
+                    OverlayCheck::Continue => {}
                 }
                 LRESULT(0)
             }
@@ -559,6 +761,7 @@ pub extern "system" fn wnd_proc(
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = KillTimer(Some(hwnd), TIMER_MOD_CHECK);
                 PostQuitMessage(0);
                 LRESULT(0)
             }
