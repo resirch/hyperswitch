@@ -32,6 +32,8 @@ pub struct Config {
     pub show_title: bool,
     /// When true, register a logon scheduled task to start Hyperswitch.
     pub run_on_startup: bool,
+    /// When true, check GitHub for a newer release on startup and prompt to update.
+    pub auto_check_updates: bool,
 }
 
 impl Default for Config {
@@ -48,6 +50,7 @@ impl Default for Config {
             current_monitor_only: true,
             show_title: true,
             run_on_startup: false,
+            auto_check_updates: true,
         }
     }
 }

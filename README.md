@@ -76,6 +76,7 @@ Options:
 | `current_monitor_only` | bool | true | Only show windows on the monitor under the cursor.    |
 | `show_title`       | bool   | true    | Draw the selected window's title below the icons.       |
 | `run_on_startup`   | bool   | false   | Start Hyperswitch at sign-in (scheduled task).          |
+| `auto_check_updates` | bool | true    | Check GitHub releases on launch and prompt to update.   |
 
 `cycle_key` accepts a single letter or digit, or one of: `Tab`, `Space`,
 `Backspace`, `Left`, `Right`, `Up`, `Down`, `Grave`.

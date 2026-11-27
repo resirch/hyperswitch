@@ -1,0 +1,28 @@
+name: Build Artifacts
+
+on:
+  push:
+    branches: ["*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build-hyperswitch:
+    name: Build hyperswitch (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build hyperswitch
+        run: cargo build --release
+
+      - name: Upload hyperswitch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyperswitch-windows
+          path: target/release/hyperswitch.exe

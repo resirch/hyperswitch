@@ -6,6 +6,7 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icon.png");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 
     let png = PathBuf::from("assets/icon.png");
     if !png.exists() {
@@ -57,8 +58,23 @@ fn main() {
         }
     }
 
-    let version = ((0u64) << 48) | ((1u64) << 32) | ((0u64) << 16) | (icon_hash as u64);
-    let version_text = format!("0.1.0.{}", icon_hash);
+    let major: u16 = std::env::var("CARGO_PKG_VERSION_MAJOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let minor: u16 = std::env::var("CARGO_PKG_VERSION_MINOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let patch: u16 = std::env::var("CARGO_PKG_VERSION_PATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let version = ((major as u64) << 48)
+        | ((minor as u64) << 32)
+        | ((patch as u64) << 16)
+        | (icon_hash as u64);
+    let version_text = format!("{major}.{minor}.{patch}.{icon_hash}");
 
     let mut res = winresource::WindowsResource::new();
     res.set_icon(ico_path.to_str().unwrap());

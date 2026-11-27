@@ -8,6 +8,7 @@ mod input;
 mod overlay;
 mod startup;
 mod state;
+mod updater;
 mod windows_enum;
 mod win_event;
 
@@ -50,6 +51,7 @@ fn main() {
 
         let config = Config::load_or_create();
         let _ = startup::sync(config.run_on_startup);
+        let auto_check_updates = config.auto_check_updates;
 
         if overlay::register_class().is_err() {
             return;
@@ -105,6 +107,7 @@ fn main() {
         let _ = PostMessageW(Some(hwnd), state::WM_HS_INIT, WPARAM(0), LPARAM(0));
 
         add_tray_icon(hwnd);
+        updater::spawn_update_check(auto_check_updates);
 
         // Standard message loop.
         let mut msg = MSG::default();
